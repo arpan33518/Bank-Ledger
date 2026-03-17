@@ -2,6 +2,9 @@ import mongoose from "mongoose";
 import Transaction from "../models/transaction.model.js";
 import Account from "../models/account.model.js";
 import Ledger from "../models/ledger.model.js";
+import User from "../models/user.model.js";
+import { sendTransactionEmail } from "../lib/mailer.js";
+import { getAuth } from "@clerk/express";
 
 
 
@@ -69,14 +72,21 @@ export const createTransaction = async (req, res) => {
         // ------------------------------------------------------------------------
         // 3. Check account status
         // ------------------------------------------------------------------------
-        const fromAccount = await Account.findById(fromAccountId);
-        const toAccount = await Account.findById(toAccountId);
+        // We use .populate("user") so we have access to their email addresses for Step 10
+        const fromAccount = await Account.findById(fromAccountId).populate("user");
+        const toAccount = await Account.findById(toAccountId).populate("user");
 
         if (!fromAccount) {
             return res.status(404).json({ error: "Sender account not found." });
         }
         if (!toAccount) {
             return res.status(404).json({ error: "Receiver account not found." });
+        }
+
+        // Verify Ownership
+        const { userId: clerkId } = getAuth(req);
+        if (!fromAccount.user || fromAccount.user.clerkId !== clerkId) {
+            return res.status(403).json({ error: "Unauthorized: You do not own the sender account." });
         }
 
         // Both accounts must be ACTIVE to transact
@@ -170,7 +180,45 @@ export const createTransaction = async (req, res) => {
             // and saves them to the actual database structure permanently and atomically.
             await session.commitTransaction();
 
-            // Setup for step 10
+            // ------------------------------------------------------------------------
+            // 10. Send email notification
+            // ------------------------------------------------------------------------
+            // We do this AFTER the commit so we don't spam people if the DB fails
+            try {
+                // Email to sender
+                if (fromAccount.user && fromAccount.user.email) {
+                    await sendTransactionEmail({
+                        toEmail: fromAccount.user.email,
+                        subject: "Funds Transferred Successfully",
+                        htmlContent: `
+                            <h3>Hi ${fromAccount.user.firstName || "Customer"},</h3>
+                            <p>You have successfully transferred <strong>$${amount}</strong> to account ${toAccount.accountName}.</p>
+                            <p>Transaction ID: ${newTransaction._id}</p>
+                            <br>
+                            <p>Thank you for using Bank Ledger!</p>
+                        `
+                    });
+                }
+                
+                // Email to receiver
+                if (toAccount.user && toAccount.user.email) {
+                    await sendTransactionEmail({
+                        toEmail: toAccount.user.email,
+                        subject: "Funds Received",
+                        htmlContent: `
+                            <h3>Hi ${toAccount.user.firstName || "Customer"},</h3>
+                            <p>You have received a transfer of <strong>$${amount}</strong> from account ${fromAccount.accountName}.</p>
+                            <p>Transaction ID: ${newTransaction._id}</p>
+                            <br>
+                            <p>Thank you for using Bank Ledger!</p>
+                        `
+                    });
+                }
+            } catch (emailError) {
+                // We just log email errors, we don't want to crash the whole successful transaction just because of Mailer downtime
+                console.error("Failed to send transaction emails:", emailError);
+            }
+
             return res.status(200).json({ 
                 message: "Transaction successful!", 
                 transaction: newTransaction 
@@ -182,6 +230,8 @@ export const createTransaction = async (req, res) => {
         } finally {
             session.endSession();
         }
+
+        
 
     } catch (error) {
         console.error("Transaction Error:", error);

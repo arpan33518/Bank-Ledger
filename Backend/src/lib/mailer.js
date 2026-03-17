@@ -20,3 +20,12 @@ export async function sendWelcomeEmail(toEmail, userName) {
     `,
   });
 }
+
+export async function sendTransactionEmail({ toEmail, subject, htmlContent }) {
+  await transporter.sendMail({
+    from: `"Bank Ledger" <${process.env.EMAIL_USER}>`,
+    to: toEmail,
+    subject,
+    html: htmlContent,
+  });
+}
